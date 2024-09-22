@@ -5,6 +5,6 @@ import (
 	"net/http"
 )
 
-func (s *AuthService) Logout(ctx context.Context, headers http.Header, r *http.Request) (string, error) {
+func (s *Service) Logout(ctx context.Context, headers http.Header, r *http.Request) (string, error) {
 	panic("not implemented yet")
 }

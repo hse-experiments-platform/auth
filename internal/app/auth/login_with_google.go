@@ -9,7 +9,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hse-experiments-platform/auth/internal/pkg/storage/db"
+	"github.com/cstati/auth/internal/pkg/storage/db"
+	pb "github.com/cstati/auth/pkg/auth"
 	errs "github.com/hse-experiments-platform/library/pkg/utils/web/errors"
 	"github.com/jackc/pgx/v5"
 )
@@ -23,18 +24,7 @@ type LoginWithGoogleResponse struct {
 	Token  string `json:"token"`
 }
 
-// LoginWithGoogle godoc
-//
-//	@Summary		Try login with Google OAuth2 token
-//	@Description	Get userID and paseto token by google oauth2 token
-//	@Accept			json
-//	@Produce		json
-//	@Param			body	body		LoginWithGoogleRequest	true	"body"
-//	@Success		200		{object}	LoginWithGoogleResponse
-//	@Failure		401		{object}	errors.CodedError
-//	@Failure		500		{object}	errors.CodedError
-//	@Router			/api/v1/login/google [post]
-func (s *AuthService) LoginWithGoogle(ctx context.Context, headers http.Header, r *http.Request) (*LoginWithGoogleResponse, error) {
+func (s *Service) LoginWithGoogle(ctx context.Context, headers http.Header, r *http.Request) (*LoginWithGoogleResponse, error) {
 	var request LoginWithGoogleRequest
 
 	if r.ContentLength == 0 {
@@ -75,4 +65,37 @@ func (s *AuthService) LoginWithGoogle(ctx context.Context, headers http.Header, 
 	}
 
 	return &LoginWithGoogleResponse{UserID: user.ID, Token: token}, nil
+}
+
+func (s *Service) GoogleLogin(ctx context.Context, r *pb.GoogleLoginRequest) (*pb.GoogleLoginResponse, error) {
+	slog.Debug("got google token", slog.String("token", r.GoogleOauthToken))
+
+	googleInfo, err := s.google.GetIDAndEmail(ctx, r.GoogleOauthToken)
+	if err != nil {
+		return nil, fmt.Errorf("s.google.GetIDAndEmail(%s): %w", r.GoogleOauthToken, err)
+	}
+
+	slog.Debug("got google info", slog.Any("info", googleInfo))
+
+	user, err := s.db.GetUserByExternalID(ctx, googleInfo.Id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if user.ID, err = s.db.CreateUser(ctx, db.CreateUserParams{
+			GoogleID: googleInfo.Id,
+			Email:    googleInfo.Email,
+		}); err != nil {
+			return nil, fmt.Errorf("s.db.CreateUser(id=%s, email=%s): %w", googleInfo.Id, googleInfo.Email, err)
+		}
+	} else if err != nil {
+
+		return nil, fmt.Errorf("s.db.GetUserIDByExternalID(%s): %w", googleInfo.Id, err)
+	}
+	token, err := s.tokenProvider.CreateToken(user.ID, nil, time.Hour*24*7)
+	if err != nil {
+		return nil, fmt.Errorf("cannot create token: %w", err)
+	}
+
+	return &pb.GoogleLoginResponse{
+		UserId: user.ID,
+		Token:  token,
+	}, nil
 }

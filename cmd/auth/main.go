@@ -2,115 +2,200 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 
-	"github.com/go-chi/chi"
-	"github.com/go-chi/chi/middleware"
-	"github.com/go-chi/cors"
-	_ "github.com/hse-experiments-platform/auth/docs"
-	"github.com/hse-experiments-platform/auth/internal/app/auth"
-	"github.com/hse-experiments-platform/auth/internal/pkg/storage/db"
-	"github.com/hse-experiments-platform/auth/internal/pkg/storage/google"
+	"github.com/cstati/auth/internal/app/auth"
+	"github.com/cstati/auth/internal/pkg/storage/db"
+	"github.com/cstati/auth/internal/pkg/storage/google"
+	pb "github.com/cstati/auth/pkg/auth"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
+	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
 	osinit "github.com/hse-experiments-platform/library/pkg/utils/init"
+	"github.com/hse-experiments-platform/library/pkg/utils/loggers"
 	"github.com/hse-experiments-platform/library/pkg/utils/token"
-	"github.com/hse-experiments-platform/library/pkg/utils/web"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
-	httpSwagger "github.com/swaggo/http-swagger"
+	"github.com/rs/cors"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/reflection"
 )
 
 func loadEnv() {
 	file := os.Getenv("DOTENV_FILE")
 	// loads values from .env into the system
 	if err := godotenv.Load(file); err != nil {
-		slog.Error("cannot load env variables", "error", err)
+		log.Fatal().Err(err).Msg("cannot load env variables")
 	}
 }
 
-//	@title			HSE MLOps Auth server
-//	@version		1.0
-//	@description	Auth service for mlops project.
+func initDB(ctx context.Context, dsnOSKey string, loadTypes ...string) *pgxpool.Pool {
+	config, err := pgxpool.ParseConfig(osinit.MustLoadEnv(dsnOSKey))
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot parse config")
+	}
 
-//	@host	tcarzverey.ru:8082
+	config.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		for _, loadType := range loadTypes {
+			t, err := conn.LoadType(context.Background(), loadType) // type
+			if err != nil {
+				log.Fatal().Err(err).Msg("cannot load type")
+			}
+			conn.TypeMap().RegisterType(t)
 
-//	@securityDefinitions.apikey	Bearer
-//	@in							header
-//	@name						Authorization
-//	@description				Enter the token with the `Bearer: ` prefix, e.g. \"Bearer abcde12345\"
+			t, err = conn.LoadType(context.Background(), "_"+loadType) // array of type
+			if err != nil {
+				log.Fatal().Err(err).Msg("cannot load type")
+			}
+			conn.TypeMap().RegisterType(t)
+		}
+
+		return nil
+	}
+
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		log.Fatal().Err(err).Str("dsn", osinit.MustLoadEnv(dsnOSKey)).Msg("cannot osinit db")
+	}
+
+	if err = pool.Ping(ctx); err != nil {
+		log.Fatal().Err(err).Msg("cannot connect to db")
+	}
+
+	return pool
+}
+
+func initService(ctx context.Context, maker token.Maker, storage google.Storage) pb.AuthServiceServer {
+	service := auth.NewService(
+		storage,
+		db.New(initDB(ctx, "DB_CONNECT_STRING")),
+		maker,
+	)
+
+	return service
+}
+
+func runGRPC(ctx context.Context, c context.CancelFunc, server pb.AuthServiceServer, grpcAddr string, maker token.Maker) {
+	opts := []logging.Option{
+		logging.WithLogOnEvents(logging.StartCall, logging.FinishCall, logging.PayloadReceived, logging.PayloadSent),
+		logging.WithFieldsFromContext(func(ctx context.Context) logging.Fields {
+			return []any{token.UserIDContextKey, ctx.Value(token.UserIDContextKey), token.UserRolesContextKey, ctx.Value(token.UserRolesContextKey)}
+		}),
+	}
+
+	s := grpc.NewServer(
+		//grpc.ChainUnaryInterceptor(
+		//	maker.TokenExtractorUnaryInterceptor(),
+		//	logging.UnaryServerInterceptor(loggers.ZerologInterceptorLogger(log.Logger), opts...),
+		//),
+		grpc.ChainStreamInterceptor(
+			logging.StreamServerInterceptor(loggers.ZerologInterceptorLogger(log.Logger), opts...),
+		),
+	)
+	pb.RegisterAuthServiceServer(s, server)
+	reflection.Register(s)
+
+	l, err := net.Listen("tcp", grpcAddr)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot get grpc net.Listener")
+	}
+
+	go func() {
+		<-ctx.Done()
+		log.Info().Msg("stropping grpc server")
+		s.GracefulStop()
+	}()
+
+	go func() {
+		log.Info().Msgf("grpc server listening on %s", grpcAddr)
+		err = s.Serve(l)
+		if err != nil {
+			log.Error().Err(err).Msg("error in grpc.Serve")
+		}
+		c()
+	}()
+}
+
+func runHTTP(ctx context.Context, c context.CancelFunc, grpcAddr string) {
+	rmux := runtime.NewServeMux()
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	err := pb.RegisterAuthServiceHandlerFromEndpoint(ctx, rmux, grpcAddr, opts)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot register rmux")
+	}
+
+	httpAddr := ":" + osinit.MustLoadEnv("HTTP_PORT")
+	l, err := net.Listen("tcp", httpAddr)
+	if err != nil {
+		log.Fatal().Err(err).Msg("cannot get http net.Listener")
+	}
+
+	//creating swagger
+	mux := http.NewServeMux()
+	// mount the gRPC HTTP gateway to the root
+	mux.Handle("/", rmux)
+	fs := http.FileServer(http.Dir("./swagger"))
+	mux.Handle("/swagger/", http.StripPrefix("/swagger/", fs))
+
+	s := http.Server{Handler: cors.AllowAll().Handler(mux)}
+
+	go func() {
+		<-ctx.Done()
+		log.Info().Msg("stropping grpc server")
+		err = s.Shutdown(ctx)
+		if err != nil {
+			log.Fatal().Err(err).Msg("cannot shutdown http server")
+		}
+	}()
+
+	go func() {
+		log.Info().Msgf("http server listening on %s", httpAddr)
+		err = s.Serve(l)
+		if err != nil {
+			log.Error().Err(err).Msg("error in http.Serve")
+		}
+		c()
+	}()
+}
+
+func run(ctx context.Context) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	googleStorage := google.NewStorage()
+	maker, err := token.NewMaker(osinit.MustLoadEnv("CIPHER_KEY"))
+	if err != nil {
+
+		log.Fatal().Err(err).Msg("cannot osinit token maker")
+	}
+	service := initService(ctx, maker, googleStorage)
+
+	grpcAddr := ":" + osinit.MustLoadEnv("GRPC_PORT")
+
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt)
+	defer func() {
+		stop()
+		cancel()
+	}()
+
+	runGRPC(ctx, cancel, service, grpcAddr, maker)
+	runHTTP(ctx, cancel, grpcAddr)
+
+	<-ctx.Done()
+}
 
 func main() {
 	ctx := context.Background()
 
-	// set default logger for env failure cases
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		AddSource: true,
-		Level:     slog.LevelDebug,
-	})))
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr}) // TimeFormat: time.Un.DateTime})
 
 	loadEnv()
 
-	createHTTPServer(ctx)
-}
-
-func initRoutes(r *chi.Mux, service *auth.AuthService) {
-	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte("Not found"))
-	})
-
-	r.Get("/swagger/*", httpSwagger.Handler(
-		httpSwagger.URL("/swagger/doc.json"),
-	))
-
-	r.Post("/api/v1/login/google", web.WithErrorHandler(service.LoginWithGoogle))
-	r.Post("/api/v1/logout", web.WithErrorHandler(service.Logout))
-	r.Get("/api/v1/validate", web.WithErrorHandler(service.ValidateToken))
-}
-
-func initDB(ctx context.Context) *pgx.Conn {
-	c, err := pgx.Connect(ctx, os.Getenv("DB_CONNECT_STRING"))
-	if err != nil {
-		slog.Error(err.Error())
-		panic(err)
-	}
-
-	return c
-}
-
-func createHTTPServer(ctx context.Context) {
-	r := chi.NewRouter()
-
-	r.Use(middleware.Logger,
-		cors.Handler(cors.Options{
-			AllowedOrigins: []string{"*"},
-			// AllowOriginFunc:  func(r *http.Request, origin string) bool { return true },
-			AllowedMethods:   []string{"POST", "PUT", "GET", "DELETE", "OPTIONS"},
-			AllowedHeaders:   []string{"*"},
-			ExposedHeaders:   []string{"Link"},
-			AllowCredentials: true,
-			MaxAge:           300, // Maximum value not ignored by any of major browsers
-		}),
-		middleware.Recoverer,
-	)
-
-	dbStorage := db.NewStorage(initDB(ctx))
-	googleStorage := google.NewStorage()
-	maker, err := token.NewMaker(osinit.MustLoadEnv("CIPHER_KEY"))
-	if err != nil {
-		slog.Error(err.Error())
-		panic(err)
-	}
-	authService := auth.NewService(googleStorage, dbStorage, maker)
-
-	initRoutes(r, authService)
-
-	port := os.Getenv("HTTP_PORT")
-	slog.Debug(fmt.Sprintf("listening on localhost:%s\n", port))
-	if err := http.ListenAndServe(":"+port, r); err != nil {
-		panic(err)
-	}
-	slog.Debug("Stopping server")
+	run(ctx)
 }

@@ -1,0 +1,67 @@
+syntax = "proto3";
+
+import "google/api/annotations.proto";
+import "protoc-gen-openapiv2/options/annotations.proto";
+import "google/protobuf/any.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+package github.cstati.admin;
+
+option go_package = "github.com/cstati/auth;auth";
+
+option (grpc.gateway.protoc_gen_openapiv2.options.openapiv2_swagger) = {
+  info: {
+    title: "Auth service";
+    version: "1.0";
+    description: "Auth service for cstati.",
+  };
+
+  schemes: HTTP;
+  consumes: "application/json";
+  produces: "application/json";
+};
+
+service AuthService {
+  rpc Ping(PingRequest) returns (PingResponse) {
+    option (google.api.http) = {
+      get: "/ping"
+    };
+  }
+
+  rpc GoogleLogin(GoogleLoginRequest) returns (GoogleLoginResponse) {
+    option (google.api.http) = {
+      post: "/login/google"
+      body: "*"
+    };
+  }
+
+  rpc ValidateToken(ValidateTokenRequest) returns (ValidateTokenResponse) {
+    option (google.api.http) = {
+      get: "/me"
+    };
+  }
+}
+
+message PingRequest {}
+
+message PingResponse {}
+
+message GoogleLoginRequest {
+  string google_oauth_token = 1;
+}
+
+message GoogleLoginResponse {
+  int64 user_id = 1;
+  string token = 2;
+}
+
+message ValidateTokenRequest {
+  string token = 1;
+}
+
+message ValidateTokenResponse {
+  int64 user_id = 1;
+  repeated string roles = 2;
+}
+

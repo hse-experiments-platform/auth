@@ -2,10 +2,12 @@ package auth
 
 import (
 	"context"
-	"net/http"
 	"strings"
 
-	errs "github.com/hse-experiments-platform/library/pkg/utils/web/errors"
+	pb "github.com/cstati/auth/pkg/auth"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type UserInfo struct {
@@ -13,27 +15,26 @@ type UserInfo struct {
 	Roles  []string `json:"roles"`
 }
 
-// CheckToken godoc
-//
-//	@Summary		Validate user's token
-//	@Description	Validate user's token and if correct return UserInfo
-//	@Produce		json
-//	@Param			Authorization	header		string	false	"Paseto encrypted token"	example(Bearer v2.local.ABCDEFG)
-//	@Success		200				{object}	UserInfo
-//	@Failure		403				{object}	errors.CodedError
-//	@Failure		500				{object}	errors.CodedError
-//	@Router			/api/v1/validate [get]
-func (s *AuthService) ValidateToken(_ context.Context, _ http.Header, r *http.Request) (*UserInfo, error) {
-	token := r.Header.Get("Authorization")
-	token = strings.TrimPrefix(token, "Bearer ")
+func (s *Service) ValidateToken(ctx context.Context, r *pb.ValidateTokenRequest) (*pb.ValidateTokenResponse, error) {
+	var token string
+
+	if r.Token != "" {
+		token = r.Token
+	} else if md, ok := metadata.FromIncomingContext(ctx); ok && len(md.Get("authorization")) == 1 {
+		authHeader := md.Get("authorization")[0]
+		token, _ = strings.CutPrefix(authHeader, "Bearer ")
+	}
+	if token == "" {
+		return nil, status.New(codes.Unauthenticated, "must provide token in body or in Authorization header").Err()
+	}
 
 	payload, err := s.tokenProvider.VerifyToken(token)
 	if err != nil {
-		return nil, errs.NewCodedError(http.StatusForbidden, err)
+		return nil, status.New(codes.PermissionDenied, err.Error()).Err()
 	}
 
-	return &UserInfo{
-		UserID: payload.UserID,
+	return &pb.ValidateTokenResponse{
+		UserId: payload.UserID,
 		Roles:  payload.Roles,
 	}, nil
 }

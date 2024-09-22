@@ -1,22 +1,21 @@
 package auth
 
 import (
-	"github.com/hse-experiments-platform/auth/internal/pkg/storage/db"
-	"github.com/hse-experiments-platform/auth/internal/pkg/storage/google"
+	"github.com/cstati/auth/internal/pkg/storage/db"
+	"github.com/cstati/auth/internal/pkg/storage/google"
+	pb "github.com/cstati/auth/pkg/auth"
 	"github.com/hse-experiments-platform/library/pkg/utils/token"
 )
 
-// typecheck
-var _ Service = &AuthService{}
-
-type AuthService struct {
+type Service struct {
+	pb.UnimplementedAuthServiceServer
 	google        google.Storage
 	db            db.Storage
 	tokenProvider token.Maker
 }
 
-func NewService(google google.Storage, db db.Storage, tokenProvider token.Maker) *AuthService {
-	return &AuthService{
+func NewService(google google.Storage, db db.Storage, tokenProvider token.Maker) *Service {
+	return &Service{
 		google:        google,
 		db:            db,
 		tokenProvider: tokenProvider,
